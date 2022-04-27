@@ -1,0 +1,92 @@
+---
+- hosts: dev
+  become: true
+  collections:
+    - community.docker
+  tasks:
+    - name: Install aptitude
+      apt:
+        name: aptitude
+        state: latest
+        update_cache: true
+
+    - name: Install required system packages
+      apt:
+        pkg:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - python3-pip
+          - virtualenv
+          - python3-setuptools
+        state: latest
+        update_cache: true
+
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+    
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu focal stable
+        state: present
+
+    - name: Update apt and install docker-ce
+      apt:
+        name: docker-ce
+        state: latest
+        update_cache: true
+
+    - name: Install Docker Module for Python
+      pip:
+        name: docker
+
+    - name: Pull ISVA docker images
+      docker_image:
+        name: "{{ image }}"
+        source: pull
+      loop:
+        - ibmcom/verify-access:10.0.3.1
+        - ibmcom/verify-access-operator:21.10.0
+        - ibmcom/verify-access-openldap:10.0.3.1
+        - ibmcom/verify-access-wrp:10.0.3.1
+        - ibmcom/verify-access-dsc:10.0.3.1
+        - ibmcom/verify-access-postgresql:10.0.3.1
+        - ibmcom/verify-access-snapshotmgr:10.0.3.1_IF1
+        - ibmcom/verify-access-operator-bundle:21.10.0
+        - ibmcom/verify-access-runtime:10.0.3.1
+      loop_control:
+        loop_var: image
+        label: "Pulling docker image {{ image }}"
+
+    - name: Creating ISVA dedicated network
+      docker_network:
+        name: isva_network
+
+    - name: Creating ISVA dedicated volume
+      docker_volume:
+        name: isva_data
+
+    - name: Creating docker configuration container
+      docker_container:
+        name: isva-config
+        image: ibmcom/verify-access:10.0.3.1
+        state: started
+        restart: yes
+        networks:
+          - name: isva_network
+        ports:
+          - "9443:9443"
+        volumes:
+          - isva_data
+        env:
+          CONTAINER_TIMEZONE: "Australia/Brisbane"
+          SERVICE: config
+          CONFIG_SERVICE_USER_NAME: admin
+          CONFIG_SERVICE_USER_PWD: admin
+          ADMIN_PWD: admin
+
+
+
