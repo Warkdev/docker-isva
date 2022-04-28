@@ -1,8 +1,8 @@
 ---
-- hosts: dev
+- name: "Setting up pre-requisites"
+  hosts: dev
   become: true
-  collections:
-    - community.docker
+  tags: [prereq]
   tasks:
     - name: Install aptitude
       apt:
@@ -43,6 +43,120 @@
       pip:
         name: docker
 
+- name: Setting up Docker environment
+  collections:
+    - community.docker
+    - community.crypto
+  hosts: dev
+  become: true
+  tags: [docker-setup]
+  vars:
+    docker_keys: "{{ lookup('env', 'HOME') }}/dockerkeys"
+    docker_share: "{{ lookup('env', 'HOME') }}/dockershare"
+    lmi_ip: 127.0.0.2
+    web1_ip: 127.0.0.3
+    web2_ip: 127.0.0.4
+    isva_version: 10.0.3.1
+  tasks:
+    - name: Adding hosts records in /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ record.ip }} {{ record.hostname }}"
+        state: present
+      loop:
+        - ip: 127.0.0.2
+          hostname: isam.iamlab.community.org
+        - ip: 127.0.0.3
+          hostname: www.iamlab.community.org
+        - ip: 127.0.0.4
+          hostname: www.iamalsolab.community.org
+      loop_control:
+        loop_var: record
+        label: "Adding host entry {{ record.hostname }}"
+
+    - name: Creating docker keys directories
+      file:
+        path: "{{ dir }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ docker_keys }}"
+        - "{{ docker_keys }}/openldap"
+        - "{{ docker_keys }}/postgresql"
+        - "{{ docker_share }}"
+      loop_control:
+        loop_var: dir
+        label: "Creating directory {{ dir }}"
+
+    - name: Create LDAP certificate private key
+      openssl_privatekey:
+        path: "{{ docker_keys }}/openldap/ldap.key"
+        owner: cedric
+        group: cedric
+
+    - name: Create LDAP certificate signing request (CSR)
+      openssl_csr_pipe:
+        privatekey_path: "{{ docker_keys }}/openldap/ldap.key"
+        common_name: openldap
+        organization_name: community
+        country_name: be
+      register: csr
+
+    - name: Create LDAP certificate files from CSR
+      x509_certificate:
+        path: "{{ docker_keys }}/openldap/ldap.crt"
+        csr_content: "{{ csr.csr }}"
+        privatekey_path: "{{ docker_keys }}/openldap/ldap.key"
+        provider: selfsigned
+        owner: cedric
+        group: cedric
+
+    - name: Copy ldap CA file
+      copy:
+        src: "{{ docker_keys }}/openldap/ldap.crt"
+        dest: "{{ docker_keys }}/openldap/ca.crt"
+
+    - name: Create LDAP Dhparam
+      openssl_dhparam:
+        path: "{{ docker_keys }}/openldap/dhparam.pem"
+        size: 2048
+        owner: cedric
+        group: cedric
+
+    - name: Create Postgresql certificate private key
+      openssl_privatekey:
+        path: "{{ docker_keys }}/postgresql/postgres.key"
+        owner: cedric
+        group: cedric
+
+    - name: Create Postgresql certificate signing request (CSR)
+      openssl_csr_pipe:
+        privatekey_path: "{{ docker_keys }}/postgresql/postgres.key"
+        common_name: postgresql
+        organization_name: community
+        country_name: be
+      register: csr
+
+    - name: Create Postgresql certificate files from CSR
+      x509_certificate:
+        path: "{{ docker_keys }}/postgresql/postgres.crt"
+        csr_content: "{{ csr.csr }}"
+        privatekey_path: "{{ docker_keys }}/postgresql/postgres.key"
+        provider: selfsigned
+        owner: cedric
+        group: cedric
+
+    - name: Merging Postgresql files in one
+      assemble:
+        src: "{{ docker_keys }}/postgresql"
+        dest: "{{ docker_keys }}/postgresql/server.pem"
+        regexp: ".*.(key|crt)"
+
+    - name: "Copy generated keys to {{ docker_share }}"
+      copy:
+        src: "{{ docker_keys }}"
+        dest: "{{ docker_share }}"
+
     - name: Pull ISVA docker images
       docker_image:
         name: "{{ image }}"
@@ -65,28 +179,80 @@
       docker_network:
         name: isva_network
 
-    - name: Creating ISVA dedicated volume
+    - name: Creating ISVA dedicated volumes
       docker_volume:
-        name: isva_data
+        name: "{{ volume }}"
+      loop:
+        - isvaconfig
+        - libldap
+        - libsecauthority
+        - ldapslapd
+        - pgdata
+      loop_control:
+        loop_var: volume
+        label: "Creating volume {{ volume }}"
 
-    - name: Creating docker configuration container
+    - name: Creating Postgresql container
       docker_container:
-        name: isva-config
+        name: postgresql
+        hostname: postgresql
+        image: ibmcom/verify-access-postgresql:10.0.3.1
+        state: started
+        restart: yes
+        networks:
+          - name: isva_network
+        volumes:
+          - pgdata:/var/lib/postgresql/data
+          - "{{ docker_share }}/dockerkeys/postgresql:/var/local"
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: Passw0rd
+          POSTGRES_DB: isva
+          POSTGRES_SSL_KEYDB: /var/local/server.pem
+
+    - name: Creating LDAP container
+      docker_container:
+        name: openldap
+        hostname: openldap
+        image: ibmcom/verify-access-openldap:10.0.3.1
+        state: started
+        restart: yes
+        networks:
+          - name: isva_network
+        ports:
+          - 127.0.0.2:1636:636
+        volumes:
+          - libldap:/var/lib/ldap
+          - ldapslapd:/etc/ldap/slapd.d
+          - libsecauthority:/var/lib/ldap.secAuthority
+          - "{{ docker_share }}/dockerkeys/openldap:/container/service/slapd/assets/certs"
+        env:
+          LDAP_DOMAIN: community.org
+          LDAP_ADMIN_PASSWORD: Passw0rd
+          LDAP_CONFIG_PASSWORD: Passw0rd
+
+    - name: Creating ISVA configuration container
+      docker_container:
+        name: isvaconfig
+        hostname: isvaconfig
         image: ibmcom/verify-access:10.0.3.1
         state: started
         restart: yes
         networks:
           - name: isva_network
         ports:
-          - "9443:9443"
+          - "127.0.0.2:443:9443"
         volumes:
-          - isva_data
+          - isvaconfig:/var/shared
         env:
-          CONTAINER_TIMEZONE: "Australia/Brisbane"
+          CONTAINER_TIMEZONE: "Europe/Brussels"
           SERVICE: config
           CONFIG_SERVICE_USER_NAME: admin
           CONFIG_SERVICE_USER_PWD: admin
-          ADMIN_PWD: admin
+          ADMIN_PWD: Passw0rd
 
+#docker run -t -d --restart always -v isamconfig:/var/shared --hostname isamwrprp1 --name isamwrprp1 -e CONTAINER_TIMEZONE=Europe/London -p ${MY_WEB1_IP}:443:443 -e SERVICE=webseal -e INSTANCE=rp1 -e AUTO_RELOAD_FREQUENCY=5 --network isam ibmcom/isam:${ISAM_VERSION}
 
+#docker run -t -d --restart always -v isamconfig:/var/shared --hostname isamruntime --name isamruntime -e CONTAINER_TIMEZONE=Europe/London -e SERVICE=runtime -e AUTO_RELOAD_FREQUENCY=5 --network isam ibmcom/isam:${ISAM_VERSION}
 
+#docker run -t -d --restart always -v isamconfig:/var/shared --hostname isamdsc --name isamdsc -e CONTAINER_TIMEZONE=Europe/London -e SERVICE=dsc -e INSTANCE=1 -e AUTO_RELOAD_FREQUENCY=5 --network isam ibmcom/isam:${ISAM_VERSION}
